@@ -1,5 +1,5 @@
 /*
- * Intel LAM_SUP unit test
+ * Intel LAM unit test
  *
  * Copyright (C) 2023 Intel
  *
@@ -18,11 +18,13 @@
 #include "vm.h"
 #include "asm/io.h"
 #include "ioram.h"
+#include "usermode.h"
 
 #define LAM57_BITS 6
 #define LAM48_BITS 15
 #define LAM57_MASK	GENMASK_ULL(62, 57)
 #define LAM48_MASK	GENMASK_ULL(62, 48)
+#define CR3_LAM_BITS_MASK (X86_CR3_LAM_U48 | X86_CR3_LAM_U57)
 
 struct invpcid_desc {
     u64 pcid : 12;
@@ -274,6 +276,52 @@ static void test_lam_sup(bool lam_enumerated, bool fep_available)
 		test_invlpg(vaddr, true);
 }
 
+static void test_lam_user(bool lam_enumerated)
+{
+	unsigned long cr3;
+	bool is_la57;
+	unsigned r;
+	bool raised_vector = false;
+	phys_addr_t paddr;
+
+	/*
+	 * The physical address width is within 36 bits, so that using identical
+	 * mapping, the linear address will be considered as user mode address
+	 * from the view of LAM.
+	 */
+	paddr = virt_to_phys(alloc_page());
+	install_page((void *)(read_cr3()& ~CR3_LAM_BITS_MASK), paddr, (void *)paddr);
+	install_page((void *)(read_cr3()& ~CR3_LAM_BITS_MASK), IORAM_BASE_PHYS,
+		     (void *)IORAM_BASE_PHYS);
+
+	cr3 = read_cr3();
+	is_la57 = !!(read_cr4() & X86_CR4_LA57);
+
+	/* Test LAM_U48 */
+	if(lam_enumerated) {
+		r = write_cr3_safe((cr3 & ~X86_CR3_LAM_U57) | X86_CR3_LAM_U48);
+		report(r==0 && ((read_cr3() & CR3_LAM_BITS_MASK) == X86_CR3_LAM_U48),
+		       "Set LAM_U48");
+	}
+
+	run_in_user((usermode_func)test_tagged_ptr, GP_VECTOR, lam_enumerated,
+		    LAM48_BITS, paddr, is_la57, &raised_vector);
+	run_in_user((usermode_func)test_tagged_mmio_ptr, GP_VECTOR, lam_enumerated,
+		    LAM48_BITS, IORAM_BASE_PHYS, is_la57, &raised_vector);
+
+
+	/* Test LAM_U57 */
+	if(lam_enumerated) {
+		r = write_cr3_safe(cr3 | X86_CR3_LAM_U57);
+		report(r==0 && (read_cr3() & X86_CR3_LAM_U57), "Set LAM_U57");
+	}
+
+	run_in_user((usermode_func)test_tagged_ptr, GP_VECTOR, lam_enumerated,
+		    LAM57_BITS, paddr, is_la57, &raised_vector);
+	run_in_user((usermode_func)test_tagged_mmio_ptr, GP_VECTOR, lam_enumerated,
+		    LAM57_BITS, IORAM_BASE_PHYS, is_la57, &raised_vector);
+}
+
 int main(int ac, char **av)
 {
 	bool lam_enumerated;
@@ -292,6 +340,7 @@ int main(int ac, char **av)
 			    "use kvm.force_emulation_prefix=1 to enable\n");
 
 	test_lam_sup(lam_enumerated, fep_available);
+	test_lam_user(lam_enumerated);
 
 	return report_summary();
 }
