@@ -3225,6 +3225,78 @@ static void invvpid_test_not_in_vmx_operation(void)
 	TEST_ASSERT(!vmx_on());
 }
 
+#define LAM57_BITS 6
+#define LAM48_BITS 15
+#define LAM57_MASK	GENMASK_ULL(62, 57)
+#define LAM48_MASK	GENMASK_ULL(62, 48)
+
+/* According to LAM mode, set metadata in high bits */
+static u64 set_metadata(u64 src, unsigned long lam)
+{
+	u64 metadata;
+
+	switch (lam) {
+	case LAM57_BITS: /* Set metadata in bits 62:57 */
+		metadata = (NONCANONICAL & ((1UL << LAM57_BITS) - 1)) << 57;
+		metadata |= (src & ~(LAM57_MASK));
+		break;
+	case LAM48_BITS: /* Set metadata in bits 62:48 */
+		metadata = (NONCANONICAL & ((1UL << LAM48_BITS) - 1)) << 48;
+		metadata |= (src & ~(LAM48_MASK));
+		break;
+	default:
+		metadata = src;
+		break;
+	}
+
+	return metadata;
+}
+
+static void invvpid_test_lam(void)
+{
+	void *vaddr;
+	struct invvpid_operand *operand;
+	int lam_bits = LAM48_BITS;
+	bool fault;
+
+	if (!this_cpu_has(X86_FEATURE_LAM)) {
+		report_skip("LAM is not supported, skip INVVPID with LAM");
+		return;
+	}
+
+	if (this_cpu_has(X86_FEATURE_LA57) && read_cr4() & X86_CR4_LA57)
+		lam_bits = LAM57_BITS;
+
+	vaddr = alloc_vpage();
+	install_page(current_page_table(), virt_to_phys(alloc_page()), vaddr);
+	operand = (struct invvpid_operand *)vaddr;
+	operand->vpid = 0xffff;
+	operand->gla = (u64)vaddr;
+
+	write_cr4_safe(read_cr4() | X86_CR4_LAM_SUP);
+	if (!(read_cr4() & X86_CR4_LAM_SUP)) {
+		report_skip("Failed to enable LAM_SUP");
+		return;
+	}
+
+	operand = (struct invvpid_operand *)vaddr;
+	operand->gla = set_metadata(operand->gla, lam_bits);
+	fault = test_for_exception(GP_VECTOR, ds_invvpid, operand);
+	report(!fault, "INVVPID (LAM on): untagged pointer + tagged addr");
+
+	operand = (struct invvpid_operand *)set_metadata((u64)operand, lam_bits);
+	operand->gla = (u64)vaddr;
+	fault = test_for_exception(GP_VECTOR, ds_invvpid, operand);
+	report(!fault, "INVVPID (LAM on): tagged pointer + untagged addr");
+
+	operand = (struct invvpid_operand *)set_metadata((u64)operand, lam_bits);
+	operand->gla = set_metadata(operand->gla, lam_bits);
+	fault = test_for_exception(GP_VECTOR, ds_invvpid, operand);
+	report(!fault, "INVVPID (LAM on): tagged pointer + tagged addr");
+
+	write_cr4_safe(read_cr4() & ~X86_CR4_LAM_SUP);
+}
+
 /*
  * This does not test real-address mode, virtual-8086 mode, protected mode,
  * or CPL > 0.
@@ -3282,6 +3354,7 @@ static void invvpid_test(void)
 	invvpid_test_pf();
 	invvpid_test_compatibility_mode();
 	invvpid_test_not_in_vmx_operation();
+	invvpid_test_lam();
 }
 
 /*
